@@ -1,11 +1,11 @@
 name: Falco Alert Collect
 
 on:
-  workflow_run:
-    workflows: ["Deploy ShopEasy"]
-    types: [completed]
-  schedule:
-    - cron: '*/5 * * * *'
+  #workflow_run:
+  #  workflows: ["Deploy ShopEasy"]
+  #  types: [completed]
+  # schedule:
+  #  - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
