@@ -2,11 +2,7 @@
 
 DevSecOps 기반 클라우드 보안 자동화 통합 서비스입니다. GitHub Actions, Terraform, AWS, Streamlit을 기반으로 코드 푸시부터 운영 중 위협 탐지까지, DevSecOps 파이프라인 전 과정을 자동화하는 것을 목표로 구축했습니다.
 
-> 5인 팀 프로젝트(K-Digital Training)로 진행된 시스템이며, 이 레포에는 전체 코드가 포함되어 있습니다. 담당 역할은 하단 [담당 역할](#담당-역할) 섹션에 명시했습니다.
-
-**진행 기간**: K-Digital Training 부트캠프 팀 프로젝트 (TEAM 5조)
-
----
+> 5인 팀 프로젝트로 진행된 시스템이며, 이 레포에는 전체 코드가 포함되어 있습니다. 담당 역할은 하단 [담당 역할](#담당-역할) 섹션에 명시했습니다.
 
 ## 배경 및 목표
 
@@ -49,7 +45,7 @@ Code Push → Semgrep Scan → Docker Build → Trivy Scan → Tfsec Scan
    → Artifacts 저장 → Dashboard 시각화
 ```
 
-<img src="pipeline-diagram.png" width="750">
+<img src="docs/pipeline-diagram.png" width="750">
 
 각 보안 도구의 결과는 GitHub Actions artifacts로 저장되고, Web Dashboard에서 시각화되어 Scan 결과 페이지에서 확인할 수 있습니다.
 
@@ -57,7 +53,7 @@ Code Push → Semgrep Scan → Docker Build → Trivy Scan → Tfsec Scan
 
 Public 노출 최소화, Private 중심 통신, 트래픽·워크로드·계정보호를 통합 설계했습니다.
 
-<img src="architecture-diagram.png" width="900">
+<img src="docs/architecture-diagram.png" width="900">
 
 - **Edge Security**: CloudFront + WAF + Shield로 서비스 진입점 보호, X-Origin-Verify로 ALB 직접 접근 차단
 - **Private Runtime Security**: EKS를 Private Subnet에 배치, Falco로 컨테이너 수준 이상행위 탐지
@@ -121,11 +117,11 @@ Public 노출 최소화, Private 중심 통신, 트래픽·워크로드·계정�
 
 **Security Insight 화면**
 
-<img src="dashboard-security-insight.png" width="500">
+<img src="docs/dashboard-security-insight.png" width="500">
 
 **AI 기반 조치 가이드 화면**
 
-<img src="dashboard-ai-guide.png" width="500">
+<img src="docs/dashboard-ai-guide.png" width="500">
 
 ---
 
