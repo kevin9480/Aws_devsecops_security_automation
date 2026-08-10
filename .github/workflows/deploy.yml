@@ -1,0 +1,1590 @@
+name: Deploy ShopEasy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: shopeasy-api
+  EKS_CLUSTER_NAME: ShopEasy-EKS
+  TERRAFORM_DIR: shopeasy-terraform
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1단계: 소스코드 보안 점검 (Semgrep)
+  # ──────────────────────────────────────────────
+  semgrep:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config auto \
+            --json \
+            --output semgrep-results.json \
+            api-server/ frontend/ || true
+
+      - name: Convert to Korean
+        if: always()
+        run: |
+          pip install deep-translator -q
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+          from deep_translator import GoogleTranslator
+          translator = GoogleTranslator(source='en', target='ko')
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          severity_kr = {"ERROR": "오류", "WARNING": "경고", "INFO": "정보"}
+          output = {
+              "도구": "Semgrep (소스코드 보안 점검)",
+              "스캔일시": now,
+              "총_발견수": 0,
+              "심각도별": {},
+              "취약점_목록": []
+          }
+          if os.path.exists("semgrep-results.json"):
+              with open("semgrep-results.json") as f:
+                  data = json.load(f)
+              results = data.get("results", [])
+              output["총_발견수"] = len(results)
+              sevs = {}
+              for r in results:
+                  s = r.get("extra", {}).get("severity", "unknown")
+                  sevs[s] = sevs.get(s, 0) + 1
+              output["심각도별"] = {severity_kr.get(k, k): v for k, v in sevs.items()}
+              for r in results:
+                msg = r.get("extra", {}).get("message", "")
+                try:
+                    msg_kr = translator.translate(msg) if msg else ""
+                except:
+                    msg_kr = msg
+
+                # 조치방법 (fix 필드)
+                fix = r.get("extra", {}).get("metadata", {}).get("fix", "")
+                refs = r.get("extra", {}).get("metadata", {}).get("references", [])
+
+                output["취약점_목록"].append({
+                    "심각도": severity_kr.get(r.get("extra", {}).get("severity", ""), r.get("extra", {}).get("severity", "")),
+                    "파일": r.get("path", ""),
+                    "라인": r.get("start", {}).get("line", ""),
+                    "설명": msg_kr,
+                    "규칙ID": r.get("check_id", ""),
+                    "CWE": r.get("extra", {}).get("metadata", {}).get("cwe", []),
+                    "조치방법": fix,        # ← 추가
+                    "참고링크": refs        # ← 추가
+                })
+          with open("semgrep-결과.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print(f"=== Semgrep 요약 ===")
+          print(f"총 발견: {output['총_발견수']}건")
+          for s, c in output["심각도별"].items():
+              print(f"  {s}: {c}건")
+          PYEOF
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-results.json
+            semgrep-결과.json
+          if-no-files-found: ignore
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'1_Semgrep_소스코드_점검','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-1-semgrep.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-1-semgrep
+      #     path: stage-1-semgrep.json
+
+  # ──────────────────────────────────────────────
+  # 2단계: Terraform 보안 점검 (tfsec)
+  # ──────────────────────────────────────────────
+  tfsec:
+    name: tfsec Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tfsec
+        run: |
+          curl -sL https://github.com/aquasecurity/tfsec/releases/download/v1.28.11/tfsec-linux-amd64 -o /usr/local/bin/tfsec
+          chmod +x /usr/local/bin/tfsec
+      - name: Run tfsec
+        run: |
+          tfsec shopeasy-terraform \
+            --format json \
+            --out tfsec-results.json \
+            --soft-fail || true
+      - name: Convert to Korean
+        if: always()
+        run: |
+          pip install deep-translator -q
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+          from deep_translator import GoogleTranslator
+          translator = GoogleTranslator(source='en', target='ko')
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          severity_kr = {"CRITICAL": "심각", "HIGH": "높음", "MEDIUM": "중간", "LOW": "낮음"}
+          output = {
+              "도구": "tfsec (Terraform 인프라 보안 점검)",
+              "스캔일시": now,
+              "총_발견수": 0,
+              "심각도별": {},
+              "취약점_목록": []
+          }
+          if os.path.exists("tfsec-results.json"):
+              with open("tfsec-results.json") as f:
+                  data = json.load(f)
+              results = data.get("results", []) or []
+              output["총_발견수"] = len(results)
+              sevs = {}
+              for r in results:
+                  s = r.get("severity", "UNKNOWN")
+                  sevs[s] = sevs.get(s, 0) + 1
+              output["심각도별"] = {severity_kr.get(k, k): v for k, v in sevs.items()}
+              for r in results:
+                  loc = r.get("location", {})
+                  desc = r.get("description", "")
+                  impact = r.get("impact", "")
+                  resolution = r.get("resolution", "")
+                  try:
+                      desc_kr = translator.translate(desc) if desc else ""
+                      impact_kr = translator.translate(impact) if impact else ""
+                      resolution_kr = translator.translate(resolution) if resolution else ""
+                  except:
+                      desc_kr, impact_kr, resolution_kr = desc, impact, resolution
+                  output["취약점_목록"].append({
+                      "심각도": severity_kr.get(r.get("severity", ""), r.get("severity", "")),
+                      "규칙ID": r.get("rule_id", ""),
+                      "파일": loc.get("filename", "").split("/")[-1] if loc.get("filename") else "",
+                      "라인": loc.get("start_line", ""),
+                      "설명": desc_kr,
+                      "영향": impact_kr,
+                      "해결방법": resolution_kr
+                  })
+          with open("tfsec-결과.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print(f"=== tfsec 요약 ===")
+          print(f"총 발견: {output['총_발견수']}건")
+          for s, c in output["심각도별"].items():
+              print(f"  {s}: {c}건")
+          PYEOF
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfsec-results
+          path: |
+            tfsec-results.json
+            tfsec-결과.json
+          if-no-files-found: ignore
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'2_tfsec_인프라_점검','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-2-tfsec.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-2-tfsec
+      #     path: stage-2-tfsec.json
+
+  # ──────────────────────────────────────────────
+  # 3단계: Terraform으로 인프라 구축
+  # ──────────────────────────────────────────────
+  terraform:
+    name: Infrastructure
+    runs-on: ubuntu-latest
+    needs: [semgrep, tfsec]
+    if: always()
+
+    outputs:
+      ecr_url: ${{ steps.tf-output.outputs.ecr_url }}
+      ecr_frontend_url: ${{ steps.tf-output.outputs.ecr_frontend_url }}
+      vpc_id: ${{ steps.tf-output.outputs.vpc_id }}
+      lb_role_arn: ${{ steps.tf-output.outputs.lb_role_arn }}
+      waf_acl_arn: ${{ steps.tf-output.outputs.waf_acl_arn }}
+      irsa_role_arn: ${{ steps.tf-output.outputs.irsa_role_arn }}
+      cloudfront_id: ${{ steps.tf-output.outputs.cloudfront_id }}
+      cloudfront_domain: ${{ steps.tf-output.outputs.cloudfront_domain }}
+      alb_sg_id: ${{ steps.tf-output.outputs.alb_sg_id }}
+
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Ensure AutoScaling Service-Linked Role exists
+        run: |
+          aws iam create-service-linked-role --aws-service-name autoscaling.amazonaws.com 2>/dev/null || true
+      - name: Bootstrap Terraform state backend
+        run: |
+          BUCKET="shopeasy-tfstate-492660417055-v1"
+          TABLE="shopeasy-tfstate-lock"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating tfstate S3 bucket..."
+            aws s3api create-bucket \
+              --bucket "$BUCKET" \
+              --region ${{ env.AWS_REGION }} \
+              --create-bucket-configuration LocationConstraint=${{ env.AWS_REGION }}
+            aws s3api put-bucket-versioning \
+              --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block \
+              --bucket "$BUCKET" \
+              --public-access-block-configuration \
+                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+            echo "S3 bucket created."
+          else
+            echo "S3 bucket already exists, skipping."
+          fi
+          if ! aws dynamodb describe-table --table-name "$TABLE" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Creating DynamoDB lock table..."
+            aws dynamodb create-table \
+              --table-name "$TABLE" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST \
+              --region ${{ env.AWS_REGION }}
+            aws dynamodb wait table-exists \
+              --table-name "$TABLE" \
+              --region ${{ env.AWS_REGION }}
+            echo "DynamoDB lock table created."
+          else
+            echo "DynamoDB lock table already exists, skipping."
+          fi
+      - name: Release stale Terraform lock
+        run: |
+          TABLE="shopeasy-tfstate-lock"
+          KEY="shopeasy-tfstate-492660417055-v1/shopeasy/terraform.tfstate"
+          LOCK_ITEM=$(aws dynamodb get-item \
+            --table-name "$TABLE" \
+            --key "{\"LockID\": {\"S\": \"$KEY\"}}" \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "{}")
+          if echo "$LOCK_ITEM" | python3 -c "import sys,json; exit(0 if json.load(sys.stdin).get('Item') else 1)" 2>/dev/null; then
+            echo "Stale lock found, removing..."
+            aws dynamodb delete-item \
+              --table-name "$TABLE" \
+              --key "{\"LockID\": {\"S\": \"$KEY\"}}" \
+              --region ${{ env.AWS_REGION }}
+            echo "Stale lock removed."
+          else
+            echo "No stale lock found."
+          fi
+      - name: Clear pending Secrets Manager deletions
+        run: |
+          for SECRET in shopeasy/db shopeasy/app; do
+            STATUS=$(aws secretsmanager describe-secret \
+              --secret-id "$SECRET" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'DeletedDate' --output text 2>/dev/null || echo "NOT_FOUND")
+            if [ "$STATUS" != "NOT_FOUND" ] && [ "$STATUS" != "None" ]; then
+              echo "$SECRET 삭제 대기 중 → 즉시 삭제"
+              aws secretsmanager delete-secret \
+                --secret-id "$SECRET" \
+                --force-delete-without-recovery \
+                --region ${{ env.AWS_REGION }} || true
+            fi
+          done
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform apply \
+            -var="github_actions_role_arn=${{ secrets.AWS_ROLE_ARN }}" \
+            -auto-approve
+
+      - name: Get Terraform Outputs
+        id: tf-output
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+          echo "ecr_frontend_url=$(terraform output -raw ecr_frontend_url)" >> "$GITHUB_OUTPUT"
+          echo "vpc_id=$(terraform output -raw vpc_id)" >> "$GITHUB_OUTPUT"
+          echo "lb_role_arn=$(terraform output -raw lb_controller_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "waf_acl_arn=$(terraform output -raw waf_web_acl_arn)" >> "$GITHUB_OUTPUT"
+          echo "irsa_role_arn=$(terraform output -raw app_irsa_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_id=$(terraform output -raw cloudfront_distribution_id)" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_domain=$(terraform output -raw cloudfront_domain_name)" >> "$GITHUB_OUTPUT"
+          echo "alb_sg_id=$(terraform output -raw alb_sg_id)" >> "$GITHUB_OUTPUT"
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'3_인프라_구축','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-3-infra.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-3-infra
+      #     path: stage-3-infra.json
+
+  # ──────────────────────────────────────────────
+  # 4단계: Backend 빌드 + Trivy + ECR 푸시
+  # ──────────────────────────────────────────────
+  build-scan-push:
+    name: Build, Scan & Push (API)
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::8}-$(date +%Y%m%d%H%M%S)"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Build Docker image
+        working-directory: api-server
+        run: |
+          ECR_URL="${{ needs.terraform.outputs.ecr_url }}"
+          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          docker build -t "${ECR_URL}:${IMAGE_TAG}" -t "${ECR_URL}:latest" .
+
+      - name: Run Trivy vulnerability scan
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy image \
+            --format json \
+            --output trivy-results.json \
+            --exit-code 0 \
+            --severity CRITICAL,HIGH,MEDIUM \
+            "${{ needs.terraform.outputs.ecr_url }}:${{ steps.meta.outputs.image_tag }}" || true
+      - name: Convert Trivy to Korean
+        if: always()
+        run: |
+          pip install deep-translator -q
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+          from deep_translator import GoogleTranslator
+          translator = GoogleTranslator(source='en', target='ko')
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          severity_kr = {"CRITICAL": "심각", "HIGH": "높음", "MEDIUM": "중간", "LOW": "낮음"}
+          output = {
+              "도구": "Trivy (Docker 이미지 취약점 점검)",
+              "스캔일시": now,
+              "총_취약점": 0,
+              "심각도별": {},
+              "취약점_목록": []
+          }
+          if os.path.exists("trivy-results.json"):
+              with open("trivy-results.json") as f:
+                  data = json.load(f)
+              total = 0
+              sevs = {}
+              for result in data.get("Results", []):
+                  vulns = result.get("Vulnerabilities", []) or []
+                  target = result.get("Target", "")
+                  total += len(vulns)
+                  for v in vulns:
+                      s = v.get("Severity", "UNKNOWN")
+                      sevs[s] = sevs.get(s, 0) + 1
+                      title = v.get("Title", "") or ""
+                      try:
+                          title_kr = translator.translate(title) if title else ""
+                      except:
+                          title_kr = title
+                      output["취약점_목록"].append({
+                          "심각도": severity_kr.get(s, s),
+                          "취약점ID": v.get("VulnerabilityID", ""),
+                          "패키지": v.get("PkgName", ""),
+                          "현재버전": v.get("InstalledVersion", ""),
+                          "수정버전": v.get("FixedVersion", "") or "없음",
+                          "설명": title_kr,
+                          "대상": target
+                      })
+              output["총_취약점"] = total
+              output["심각도별"] = {severity_kr.get(k, k): v for k, v in sevs.items()}
+          with open("trivy-결과.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print(f"=== Trivy 요약 ===")
+          print(f"총 취약점: {output['총_취약점']}건")
+          for s, c in output["심각도별"].items():
+              print(f"  {s}: {c}건")
+          PYEOF
+      - name: Upload Trivy Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.json
+            trivy-결과.json
+          if-no-files-found: ignore
+
+      - name: Push to ECR
+        run: |
+          ECR_URL="${{ needs.terraform.outputs.ecr_url }}"
+          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          docker push "${ECR_URL}:${IMAGE_TAG}"
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'4_API_빌드_Trivy_점검','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-4-api-build.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-4-api-build
+      #     path: stage-4-api-build.json
+
+  # ──────────────────────────────────────────────
+  # 5단계: Frontend 빌드 + ECR 푸시
+  # ──────────────────────────────────────────────
+  build-frontend:
+    name: Build & Push (Frontend)
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    outputs:
+      frontend_tag: ${{ steps.meta.outputs.frontend_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          FRONTEND_TAG="${GITHUB_SHA::8}-$(date +%Y%m%d%H%M%S)"
+          echo "frontend_tag=$FRONTEND_TAG" >> "$GITHUB_OUTPUT"
+      - name: Build and push frontend
+        working-directory: frontend
+        run: |
+          ECR_URL="${{ needs.terraform.outputs.ecr_frontend_url }}"
+          TAG="${{ steps.meta.outputs.frontend_tag }}"
+          docker build -t "${ECR_URL}:${TAG}" -t "${ECR_URL}:latest" .
+          docker push "${ECR_URL}:${TAG}"
+          docker push "${ECR_URL}:latest"
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'5_Frontend_빌드','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-5-frontend.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-5-frontend
+      #     path: stage-5-frontend.json
+
+  # ──────────────────────────────────────────────
+  # 6단계: EKS에 배포 + ALB
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [terraform, build-scan-push, build-frontend]
+
+    outputs:
+      alb_url: ${{ steps.alb.outputs.alb_url }}
+      cloudfront_url: ${{ steps.cf-update.outputs.cloudfront_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+      - name: Grant EKS cluster access to current IAM principal
+        run: |
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          aws eks create-access-entry \
+            --cluster-name ${{ env.EKS_CLUSTER_NAME }} \
+            --principal-arn "$CALLER_ARN" \
+            --type STANDARD 2>/dev/null || true
+          aws eks associate-access-policy \
+            --cluster-name ${{ env.EKS_CLUSTER_NAME }} \
+            --principal-arn "$CALLER_ARN" \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster 2>/dev/null || true
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Create namespace (if not exists)
+        run: |
+          kubectl create namespace shopeasy --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy API server
+        run: |
+          export ECR_URL="${{ needs.terraform.outputs.ecr_url }}"
+          export IMAGE_TAG="${{ needs.build-scan-push.outputs.image_tag }}"
+          export IRSA_ROLE="${{ needs.terraform.outputs.irsa_role_arn }}"
+          envsubst < k8s/serviceaccount.yaml | kubectl apply -f -
+
+          DB_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "shopeasy/db" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'SecretString' --output text)
+
+          APP_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "shopeasy/app" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'SecretString' --output text)
+
+          DB_HOST=$(echo "$DB_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['host'])")
+          DB_USER=$(echo "$DB_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+          DB_PASSWORD=$(echo "$DB_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+          JWT_SECRET=$(echo "$APP_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['jwt_secret'])")
+          S3_BUCKET=$(echo "$APP_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['s3_bucket'])")
+          DYNAMODB_TABLE=$(echo "$APP_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['dynamodb_table'])")
+
+          kubectl create secret generic shopeasy-app-secrets \
+            -n shopeasy \
+            --from-literal=DB_HOST="$DB_HOST" \
+            --from-literal=DB_USER="$DB_USER" \
+            --from-literal=DB_PASSWORD="$DB_PASSWORD" \
+            --from-literal=JWT_SECRET="$JWT_SECRET" \
+            --from-literal=S3_BUCKET="$S3_BUCKET" \
+            --from-literal=DYNAMODB_TABLE="$DYNAMODB_TABLE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          sed \
+            -e "s|IMAGE_PLACEHOLDER|${ECR_URL}:${IMAGE_TAG}|g" \
+            k8s/deployment.yaml | envsubst | kubectl apply -f -
+
+          kubectl apply -f k8s/service.yaml
+
+      - name: Deploy Frontend
+        run: |
+          ECR_URL="${{ needs.terraform.outputs.ecr_frontend_url }}"
+          FRONTEND_TAG="${{ needs.build-frontend.outputs.frontend_tag }}"
+          sed -e "s|FRONTEND_IMAGE_PLACEHOLDER|${ECR_URL}:${FRONTEND_TAG}|g" \
+            k8s/frontend-deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/frontend-service.yaml
+
+
+      - name: Wait for rollouts
+        run: |
+          set +e
+          echo "=== rollout api ==="
+          kubectl rollout status deployment/shopeasy-api -n shopeasy --timeout=120s
+          echo "=== rollout frontend ==="
+          kubectl rollout status deployment/shopeasy-frontend -n shopeasy --timeout=120s
+          echo "=== pods ==="
+          kubectl get pods -n shopeasy
+          echo "=== events ==="
+          kubectl get events -n shopeasy --sort-by='.lastTimestamp' | tail -30
+          echo "=== describe ==="
+          kubectl describe pods -n shopeasy
+          echo "=== logs ==="
+          kubectl logs -n shopeasy -l app=shopeasy-api --tail=100 || true
+
+
+      - name: Seed database if empty
+        run: |
+          echo "=== Running seed.js ==="
+          kubectl exec -n shopeasy deployment/shopeasy-api -- node seed.js
+          echo "=== Seed complete ==="
+
+      - name: Ensure ALB to Pod SG rule
+        run: |
+          NODE_SG=$(aws ec2 describe-security-groups --region ${{ env.AWS_REGION }} \
+            --filters "Name=group-name,Values=shopeasy-eks-nodes-sg" \
+            --query "SecurityGroups[0].GroupId" --output text)
+
+          EXISTING=$(aws ec2 describe-security-groups \
+            --group-ids "$NODE_SG" \
+            --query "SecurityGroups[0].IpPermissions[?FromPort==\`5000\`]" \
+            --output text)
+          if [ -z "$EXISTING" ]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$NODE_SG" --protocol tcp --port 5000 \
+              --cidr 10.0.0.0/16 --region ${{ env.AWS_REGION }} || true
+          fi
+
+          EXISTING=$(aws ec2 describe-security-groups \
+            --group-ids "$NODE_SG" \
+            --query "SecurityGroups[0].IpPermissions[?FromPort==\`80\`]" \
+            --output text)
+          if [ -z "$EXISTING" ]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$NODE_SG" --protocol tcp --port 80 \
+              --cidr 10.0.0.0/16 --region ${{ env.AWS_REGION }} || true
+          fi
+      - name: Install AWS Load Balancer Controller
+        run: |
+          LB_ROLE_ARN="${{ needs.terraform.outputs.lb_role_arn }}"
+          VPC_ID="${{ needs.terraform.outputs.vpc_id }}"
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName=${{ env.EKS_CLUSTER_NAME }} \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${LB_ROLE_ARN}" \
+            --set region=${{ env.AWS_REGION }} \
+            --set vpcId="${VPC_ID}" \
+            --wait --timeout=120s
+      - name: Wait for LB Controller ready
+        run: |
+          kubectl rollout status deployment/aws-load-balancer-controller \
+            -n kube-system --timeout=120s
+      - name: Apply Ingress
+        run: |
+          WAF_ACL_ARN="${{ needs.terraform.outputs.waf_acl_arn }}"
+          ALB_SG_ID="${{ needs.terraform.outputs.alb_sg_id }}"
+          sed -e "s|WAF_ACL_ARN_PLACEHOLDER|${WAF_ACL_ARN}|g" \
+              -e "s|ALB_SG_ID_PLACEHOLDER|${ALB_SG_ID}|g" \
+            k8s/ingress.yaml | kubectl apply -f -
+      - name: Wait for ALB provisioning
+        id: alb
+        run: |
+          for i in $(seq 1 60); do
+            ALB_URL=$(kubectl get ingress -n shopeasy shopeasy-ingress \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$ALB_URL" ]; then
+              echo "alb_url=$ALB_URL" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ALB_URL" ]; then exit 1; fi
+      - name: Update CloudFront origin to ALB
+        id: cf-update
+        run: |
+          CF_ID="${{ needs.terraform.outputs.cloudfront_id }}"
+          CF_DOMAIN="${{ needs.terraform.outputs.cloudfront_domain }}"
+          ALB_URL="${{ steps.alb.outputs.alb_url }}"
+
+          # 현재 배포 설정 조회
+          aws cloudfront get-distribution-config --id "$CF_ID" > /tmp/cf-config.json
+          ETAG=$(python3 -c "import json; print(json.load(open('/tmp/cf-config.json'))['ETag'])")
+
+          # origin domain_name을 실제 ALB DNS로 교체
+          # ALB_URL을 환경변수로 전달 (heredoc 내 쉘 변수 미확장 문제 방지)
+          export CF_ALB_URL="$ALB_URL"
+          python3 << 'PYEOF'
+          import json, os
+          alb_url = os.environ['CF_ALB_URL']
+          with open('/tmp/cf-config.json') as f:
+              data = json.load(f)
+          config = data['DistributionConfig']
+          config['Origins']['Items'][0]['DomainName'] = alb_url
+          with open('/tmp/cf-update.json', 'w') as f:
+              json.dump(config, f)
+          PYEOF
+
+          aws cloudfront update-distribution \
+            --id "$CF_ID" \
+            --distribution-config "file:///tmp/cf-update.json" \
+            --if-match "$ETAG" > /dev/null
+
+          echo "cloudfront_url=$CF_DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "CloudFront origin updated: $ALB_URL"
+          echo "CloudFront URL: https://$CF_DOMAIN"
+
+      - name: Show deployment status
+        run: |
+          kubectl get pods -n shopeasy -o wide
+          kubectl get svc -n shopeasy
+          kubectl get ingress -n shopeasy
+          echo ""
+          ALB_URL="${{ steps.alb.outputs.alb_url }}"
+          CF_DOMAIN="${{ needs.terraform.outputs.cloudfront_domain }}"
+          echo "=== Access URLs ==="
+          echo "Frontend: https://$CF_DOMAIN/"
+          echo "Health:   https://$CF_DOMAIN/api/health"
+          echo "Products: https://$CF_DOMAIN/api/products"
+          echo "(ALB direct: http://$ALB_URL — CloudFront 외 직접 접근 차단됨)"
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'6_EKS_배포','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-6-deploy.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-6-deploy
+      #     path: stage-6-deploy.json
+
+  # ──────────────────────────────────────────────
+  # 7단계: 배포 후 서비스 점검 (Nuclei)
+  # ──────────────────────────────────────────────
+  nuclei:
+    name: Nuclei Scan
+    runs-on: ubuntu-latest
+    needs: deploy
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nuclei
+        run: |
+          curl -sL https://github.com/projectdiscovery/nuclei/releases/download/v3.3.7/nuclei_3.3.7_linux_amd64.zip -o nuclei.zip
+          unzip nuclei.zip -d /usr/local/bin/
+          chmod +x /usr/local/bin/nuclei
+      - name: Wait for CloudFront propagation
+        run: |
+          CF_URL="${{ needs.deploy.outputs.cloudfront_url }}"
+          echo "CloudFront 전파 대기 중: https://$CF_URL/api/health"
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L "https://${CF_URL}/api/health" 2>/dev/null || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "CloudFront 준비 완료 (시도 $i)"
+              break
+            fi
+            echo "시도 $i: status=$STATUS, 30초 대기..."
+            sleep 30
+          done
+      - name: Run Nuclei scan
+        run: |
+          CF_URL="${{ needs.deploy.outputs.cloudfront_url }}"
+          echo "https://${CF_URL}" > targets.txt
+          echo "https://${CF_URL}/api/health" >> targets.txt
+          echo "https://${CF_URL}/api/products" >> targets.txt
+          nuclei \
+            -list targets.txt \
+            -tags tech,misconfig,exposure,auth,default-logins \
+            -exclude-tags wordpress,drupal,joomla,dos,fuzz \
+            -severity critical,high,medium \
+            -json-export nuclei-results.json \
+            -silent -timeout 5 -retries 0 -rate-limit 30 || true
+      - name: Convert Nuclei to Korean
+        if: always()
+        run: |
+          pip install deep-translator -q
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+          from deep_translator import GoogleTranslator
+          translator = GoogleTranslator(source='en', target='ko')
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          severity_kr = {"critical": "심각", "high": "높음", "medium": "중간", "low": "낮음", "info": "정보"}
+          output = {
+              "도구": "Nuclei (배포 서비스 보안 점검)",
+              "스캔일시": now,
+              "총_발견수": 0,
+              "심각도별": {},
+              "취약점_목록": []
+          }
+          if os.path.exists("nuclei-results.json"):
+              with open("nuclei-results.json") as f:
+                  raw = json.load(f)
+              results = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+              output["총_발견수"] = len(results)
+              sevs = {}
+              for r in results:
+                  s = r.get("info", {}).get("severity", "unknown")
+                  sevs[s] = sevs.get(s, 0) + 1
+                  desc = r.get("info", {}).get("description", "")
+                  try:
+                      desc_kr = translator.translate(desc) if desc else ""
+                  except:
+                      desc_kr = desc
+                  output["취약점_목록"].append({
+                      "심각도": severity_kr.get(s, s),
+                      "이름": r.get("info", {}).get("name", ""),
+                      "설명": desc_kr,
+                      "대상URL": r.get("matched-at", ""),
+                      "템플릿ID": r.get("template-id", ""),
+                      "태그": r.get("info", {}).get("tags", [])
+                  })
+              output["심각도별"] = {severity_kr.get(k, k): v for k, v in sevs.items()}
+          with open("nuclei-결과.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print(f"=== Nuclei 요약 ===")
+          print(f"총 발견: {output['총_발견수']}건")
+          for s, c in output["심각도별"].items():
+              print(f"  {s}: {c}건")
+          PYEOF
+      - name: Upload Nuclei Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-results
+          path: |
+            nuclei-results.json
+            nuclei-결과.json
+          if-no-files-found: ignore
+
+      # - name: Report Stage Status
+      #   if: always()
+      #   run: |
+      #     STATUS="${{ job.status }}"
+      #     python3 -c "
+      #     import json
+      #     from datetime import datetime, timezone, timedelta
+      #     kst = timezone(timedelta(hours=9))
+      #     now = datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+      #     json.dump({'단계':'7_Nuclei_서비스_점검','상태':'완료' if '${STATUS}'=='success' else '실패','완료시각':now}, open('stage-7-nuclei.json','w',encoding='utf-8'), ensure_ascii=False, indent=2)
+      #     "
+      # - name: Upload Stage Status
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: stage-7-nuclei
+      #     path: stage-7-nuclei.json
+
+  # ──────────────────────────────────────────────
+  # 8단계: Falco 런타임 보안 모니터링 설치
+  # ──────────────────────────────────────────────
+  falco-install:
+    name: Install Falco
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    continue-on-error: true
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Get Falco S3 bucket name
+        id: falco-bucket
+        run: |
+          BUCKET=$(aws s3api list-buckets \
+            --query "Buckets[?starts_with(Name, 'shopeasy-falco-alerts')].Name | [0]" \
+            --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Install Falco + Falcosidekick via Helm
+        run: |
+          BUCKET="${{ steps.falco-bucket.outputs.bucket }}"
+          REGION="${{ env.AWS_REGION }}"
+
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo update
+
+          helm upgrade --install falco falcosecurity/falco \
+            --namespace falco \
+            --create-namespace \
+            --set driver.kind=ebpf \
+            --set falcosidekick.enabled=true \
+            --set falcosidekick.config.aws.s3.bucket="$BUCKET" \
+            --set falcosidekick.config.aws.s3.prefix="alerts" \
+            --set falcosidekick.config.aws.region="$REGION" \
+            --set falcosidekick.config.aws.s3.minimumpriority="warning" \
+            --set tolerations[0].operator=Exists \
+            --wait --timeout=180s || true
+
+          echo "=== Falco pods ==="
+          kubectl get pods -n falco
+
+
+  # ──────────────────────────────────────────────
+  # 9단계: prowler
+  # ──────────────────────────────────────────────
+  prowler-scan:
+    name: Prowler Infrastructure Scan
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    continue-on-error: true
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Prowler
+        run: pip install prowler
+
+      - name: Run Prowler
+        run: |
+          prowler aws \
+            --region ap-northeast-2 \
+            -f ap-northeast-2 \
+            -M json-ocsf \
+            -o ./prowler-out || true
+
+      - name: Process Prowler results
+        run: |
+          pip install deep-translator -q
+          python3 << 'EOF'
+          import json, glob, os, re
+          from datetime import datetime, timezone, timedelta
+          from deep_translator import GoogleTranslator
+
+          translator = GoogleTranslator(source='en', target='ko')
+          kst = timezone(timedelta(hours=9))
+
+          def safe_translate(text):
+              if not text or not isinstance(text, str):
+                  return text
+              try:
+                  return translator.translate(text) if text.strip() else text
+              except:
+                  return text
+
+          files = glob.glob("./prowler-out/*.json*")
+          if not files:
+              print("No prowler output found")
+              exit(1)
+
+          findings = []
+          for fp in files:
+              with open(fp) as f:
+                  content = f.read().strip()
+              # OCSF는 줄마다 JSON 객체 (NDJSON) 또는 배열 둘 다 처리
+              try:
+                  raw = json.loads(content)
+                  if isinstance(raw, list):
+                      findings += raw
+                  else:
+                      findings.append(raw)
+              except json.JSONDecodeError:
+                  # NDJSON (줄마다 JSON)
+                  for line in content.splitlines():
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          findings.append(json.loads(line))
+                      except:
+                          continue
+
+          fails = []
+          for f in findings:
+              # OCSF 포맷: status_code 또는 status
+              status = str(
+                  f.get("status_code",
+                  f.get("status",
+                  f.get("Status", "")))
+              ).upper()
+              if status in ("FAIL", "FAILED"):
+                  fails.append(f)
+
+          severity_kr = {
+              "critical": "심각", "high": "높음",
+              "medium": "중간", "low": "낮음", "informational": "정보"
+          }
+          sev_map = {"심각": 0, "높음": 0, "중간": 0, "낮음": 0, "정보": 0}
+          service_map = {}
+          vuln_list = []
+
+          for item in fails:
+              sev_raw = str(item.get("severity", item.get("finding_info", {}).get("severity", "informational"))).lower()
+              if sev_raw not in severity_kr:
+                  sev_raw = "informational"
+              sev_kr = severity_kr[sev_raw]
+              sev_map[sev_kr] = sev_map.get(sev_kr, 0) + 1
+
+              resources = item.get("resources", [])
+              svc = "기타"
+              if resources:
+                  svc = resources[0].get("type", resources[0].get("name", "기타"))
+                  svc = re.sub(r'(?<!^)(?=[A-Z])', '_', svc.replace("Aws", "")).lower().strip("_")
+              svc = svc or item.get("service_name", item.get("cloud", {}).get("service", {}).get("name", "기타"))
+              service_map[svc] = service_map.get(svc, 0) + 1
+
+              title = item.get("check_title",
+                      item.get("title",
+                      item.get("finding_info", {}).get("title", "-")))
+              desc  = item.get("status_extended",
+                      item.get("message",
+                      item.get("finding_info", {}).get("desc", "-")))
+              check_id = item.get("check_id",
+                         item.get("finding_info", {}).get("uid", "-"))
+
+              resource_id = "-"
+              if resources:
+                  resource_id = resources[0].get("uid", resources[0].get("name", "-"))
+
+              region = item.get("region",
+                       item.get("cloud", {}).get("region", "-"))
+
+              # ── 번역 ──
+              title_kr = safe_translate(title)
+              desc_kr  = safe_translate(desc)
+
+              vuln_list.append({
+                  "심각도":  sev_kr,
+                  "서비스":  svc,
+                  "체크ID":  check_id,
+                  "제목":    title_kr,
+                  "리소스":  resource_id,
+                  "리전":    region,
+                  "설명":    desc_kr,
+              })
+
+          result = {
+              "도구": "Prowler (AWS 인프라 보안 점검)",
+              "스캔일시": datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S"),
+              "총_발견수": len(fails),
+              "심각도별": sev_map,
+              "서비스별": service_map,
+              "취약점_목록": vuln_list,
+          }
+
+          os.makedirs("prowler-summary", exist_ok=True)
+          with open("prowler-summary/결과.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+
+          print(f"총 findings: {len(findings)}개 파싱")
+          print(f"FAIL: {len(fails)}건")
+          for s, c in sev_map.items():
+              if c > 0:
+                  print(f"  {s}: {c}건")
+          EOF
+
+      - name: Upload prowler results
+        uses: actions/upload-artifact@v4
+        with:
+          name: prowler-results
+          path: prowler-summary/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # 10단계: 전체 요약 리포트 생성
+  # ──────────────────────────────────────────────
+  summary:
+    name: Scan Summary
+    runs-on: ubuntu-latest
+    needs: [semgrep, tfsec, terraform, build-scan-push, build-frontend, deploy, nuclei, falco-install, prowler-scan]
+    if: always()
+
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+
+      - name: Generate Pipeline Status
+        run: |
+          python3 << 'PYEOF2'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          commit = os.environ.get("GITHUB_SHA", "unknown")[:8]
+          status = {
+              "제목": "ShopEasy 파이프라인 실행 현황",
+              "실행일시": now,
+              "커밋": commit,
+              "단계별_상태": {
+                  "1_Semgrep_소스코드_점검": "${{ needs.semgrep.result }}",
+                  "2_tfsec_인프라_점검": "${{ needs.tfsec.result }}",
+                  "3_인프라_구축": "${{ needs.terraform.result }}",
+                  "4_API_빌드_Trivy_점검": "${{ needs.build-scan-push.result }}",
+                  "5_Frontend_빌드": "${{ needs.build-frontend.result }}",
+                  "6_EKS_배포": "${{ needs.deploy.result }}",
+                  "7_Nuclei_서비스_점검": "${{ needs.nuclei.result }}",
+                  "8_Prowler_인프라_점검": "${{ needs.prowler-scan.result }}"
+              },
+              "요약": {}
+          }
+          total = len(status["단계별_상태"])
+          success = sum(1 for v in status["단계별_상태"].values() if v == "success")
+          failed = sum(1 for v in status["단계별_상태"].values() if v == "failure")
+          skipped = sum(1 for v in status["단계별_상태"].values() if v == "skipped")
+          status["요약"] = {"전체_단계": total, "성공": success, "실패": failed, "건너뜀": skipped, "결과": "성공" if failed == 0 else "실패"}
+          with open("파이프라인-현황.json", "w", encoding="utf-8") as f:
+              json.dump(status, f, ensure_ascii=False, indent=2)
+          print("=" * 50)
+          print(f"  파이프라인 실행 현황")
+          print(f"  실행일시: {now}")
+          print("=" * 50)
+          for step, result in status["단계별_상태"].items():
+              icon = "성공" if result == "success" else ("실패" if result == "failure" else "건너뜀")
+              print(f"  {step}: {icon}")
+          print("-" * 50)
+          s = status["요약"]
+          print(f"  전체: {s['전체_단계']} | 성공: {s['성공']} | 실패: {s['실패']} | 건너뜀: {s['건너뜀']}")
+          PYEOF2
+      - name: Generate Korean Summary
+        run: |
+          python3 << 'PYEOF'
+          import json, os, glob
+          from datetime import datetime, timezone, timedelta
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          commit = os.environ.get("GITHUB_SHA", "unknown")[:8]
+          summary = {
+              "제목": "ShopEasy 보안 스캔 종합 리포트",
+              "스캔일시": now,
+              "커밋": commit,
+              "도구별_결과": {},
+              "전체_요약": {
+                  "총_취약점": 0,
+                  "심각": 0, "높음": 0, "중간": 0, "낮음": 0, "정보": 0
+              }
+          }
+          kr_files = glob.glob("scan-results/**/*결과.json", recursive=True)
+          for fp in kr_files:
+              with open(fp, encoding="utf-8") as f:
+                  data = json.load(f)
+              tool_name = data.get("도구", "")
+              total = data.get("총_발견수", data.get("총_취약점", 0))
+              by_sev = data.get("심각도별", {})
+              summary["도구별_결과"][tool_name] = {"총_발견수": total, "심각도별": by_sev}
+              summary["전체_요약"]["총_취약점"] += total
+              for sev, count in by_sev.items():
+                  if sev in summary["전체_요약"]:
+                      summary["전체_요약"][sev] += count
+          with open("종합-리포트.json", "w", encoding="utf-8") as f:
+              json.dump(summary, f, ensure_ascii=False, indent=2)
+          t = summary["전체_요약"]
+          print(f"전체 요약: 총 {t['총_취약점']}건")
+          PYEOF
+      - name: Upload Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-summary
+          path: |
+            종합-리포트.json
+            파이프라인-현황.json
+          if-no-files-found: ignore
+
+  # ──────────────────────────────────────────────
+  # 11단계: AWS 인프라 구조 수집
+  # ──────────────────────────────────────────────
+  infra-map:
+    name: Infra Map
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+
+      - name: Collect AWS infrastructure
+        run: |
+          pip install boto3 -q
+          python3 << 'PYEOF'
+          import boto3, json, re
+          from datetime import datetime, timezone, timedelta
+          kst = timezone(timedelta(hours=9))
+          now = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+          region = "ap-northeast-2"
+          ec2  = boto3.client("ec2",  region_name=region)
+          eks  = boto3.client("eks",  region_name=region)
+          elb  = boto3.client("elbv2",region_name=region)
+          rds  = boto3.client("rds",  region_name=region)
+          s3   = boto3.client("s3")
+          ddb  = boto3.client("dynamodb", region_name=region)
+          ecr  = boto3.client("ecr",  region_name=region)
+          waf  = boto3.client("wafv2", region_name=region)
+          sm   = boto3.client("secretsmanager", region_name=region)
+
+          def safe(fn, default=None):
+              try: return fn()
+              except: return default
+
+          # ── VPC ──
+          vpcs = []
+          for v in safe(lambda: ec2.describe_vpcs()["Vpcs"], []):
+              vid  = v["VpcId"]
+              name = next((t["Value"] for t in v.get("Tags",[]) if t["Key"]=="Name"), vid)
+
+              subnets = safe(lambda: ec2.describe_subnets(
+                  Filters=[{"Name":"vpc-id","Values":[vid]}])["Subnets"], [])
+              sgs = safe(lambda: ec2.describe_security_groups(
+                  Filters=[{"Name":"vpc-id","Values":[vid]}])["SecurityGroups"], [])
+              igws = safe(lambda: ec2.describe_internet_gateways(
+                  Filters=[{"Name":"attachment.vpc-id","Values":[vid]}])["InternetGateways"], [])
+              nats = safe(lambda: ec2.describe_nat_gateways(
+                  Filters=[{"Name":"vpc-id","Values":[vid]},
+                           {"Name":"state","Values":["available"]}])["NatGateways"], [])
+              endpoints = safe(lambda: ec2.describe_vpc_endpoints(
+                  Filters=[{"Name":"vpc-id","Values":[vid]}])["VpcEndpoints"], [])
+              nacls = safe(lambda: ec2.describe_network_acls(
+                  Filters=[{"Name":"vpc-id","Values":[vid]}])["NetworkAcls"], [])
+              flow_logs = safe(lambda: ec2.describe_flow_logs(
+                  Filters=[{"Name":"resource-id","Values":[vid]}])["FlowLogs"], [])
+              route_tables = safe(lambda: ec2.describe_route_tables(
+                  Filters=[{"Name":"vpc-id","Values":[vid]}])["RouteTables"], [])
+
+              # Route Table 정리 (Public→IGW, Private→NAT 흐름)
+              rt_list = []
+              rt_subnet_map = {}
+              for rt in route_tables:
+                  has_igw  = any(r.get("GatewayId","").startswith("igw-") for r in rt.get("Routes",[]))
+                  has_nat  = any(r.get("NatGatewayId","") for r in rt.get("Routes",[]))
+                  rt_name  = next((t["Value"] for t in rt.get("Tags",[]) if t["Key"]=="Name"), rt["RouteTableId"])
+                  rt_type  = "public" if has_igw else ("private" if has_nat else "local")
+                  assoc_subnets = [a["SubnetId"] for a in rt.get("Associations",[]) if a.get("SubnetId")]
+                  rt_list.append({
+                      "id": rt["RouteTableId"],
+                      "name": rt_name,
+                      "type": rt_type,
+                      "associated_subnets": assoc_subnets,
+                  })
+                  for sid in assoc_subnets:
+                      rt_subnet_map[sid] = has_igw
+
+              # subnet public 여부: 이름 or Route Table or MapPublicIpOnLaunch
+              def is_public(s):
+                  sname = next((t["Value"] for t in s.get("Tags",[]) if t["Key"]=="Name"), "").lower()
+                  if "public" in sname: return True
+                  if s.get("MapPublicIpOnLaunch"): return True
+                  return rt_subnet_map.get(s["SubnetId"], False)
+
+              vpcs.append({
+                  "id": vid,
+                  "name": name,
+                  "cidr": v.get("CidrBlock",""),
+                  "is_default": v.get("IsDefault", False),
+                  "internet_gateway": [
+                      {"id": igw["InternetGatewayId"]} for igw in igws
+                  ],
+                  "flow_logs_enabled": len(flow_logs) > 0,
+                  "subnets": [
+                      {
+                          "id": s["SubnetId"],
+                          "name": next((t["Value"] for t in s.get("Tags",[]) if t["Key"]=="Name"), s["SubnetId"]),
+                          "cidr": s.get("CidrBlock",""),
+                          "az": s.get("AvailabilityZone",""),
+                          "public": is_public(s),
+                      } for s in subnets
+                  ],
+                  "security_groups": [
+                      {
+                          "id": sg["GroupId"],
+                          "name": sg.get("GroupName",""),
+                          "description": sg.get("Description",""),
+                      } for sg in sgs
+                  ],
+                  "nat_gateways": [
+                      {
+                          "id": n["NatGatewayId"],
+                          "state": n.get("State",""),
+                          "subnet_id": n.get("SubnetId",""),
+                          "public_ip": n.get("NatGatewayAddresses",[{}])[0].get("PublicIp","") if n.get("NatGatewayAddresses") else "",
+                      } for n in nats
+                  ],
+                  "route_tables": rt_list,
+                  "vpc_endpoints": [
+                      {
+                          "id": e["VpcEndpointId"],
+                          "service": e.get("ServiceName","").split(".")[-1],
+                          "type": e.get("VpcEndpointType",""),
+                          "state": e.get("State",""),
+                      } for e in endpoints
+                  ],
+                  "nacls": [
+                      {
+                          "id": nacl["NetworkAclId"],
+                          "is_default": nacl.get("IsDefault", False),
+                          "associated_subnets": [a["SubnetId"] for a in nacl.get("Associations",[])],
+                          "inbound_rules": len([r for r in nacl.get("Entries",[]) if not r.get("Egress")]),
+                          "outbound_rules": len([r for r in nacl.get("Entries",[]) if r.get("Egress")]),
+                      } for nacl in nacls
+                  ],
+              })
+
+          # ── EKS (인스턴스 타입 버그 수정) ──
+          eks_clusters = []
+          for cname in safe(lambda: eks.list_clusters()["clusters"], []):
+              c   = safe(lambda: eks.describe_cluster(name=cname)["cluster"], {})
+              ngs = safe(lambda: eks.list_nodegroups(clusterName=cname)["nodegroups"], [])
+              ng_details = []
+              for ng in ngs:
+                  d = safe(lambda: eks.describe_nodegroup(clusterName=cname, nodegroupName=ng)["nodegroup"], {})
+                  # 인스턴스 타입: nodegroup에서 못 가져오면 Launch Template에서 시도
+                  instance_types = d.get("instanceTypes", [])
+                  if not instance_types:
+                      lt = d.get("launchTemplate", {})
+                      if lt.get("id") or lt.get("name"):
+                          lt_data = safe(lambda: ec2.describe_launch_template_versions(
+                              LaunchTemplateId=lt["id"],
+                              Versions=[lt.get("version","$Latest")]
+                          )["LaunchTemplateVersions"], [])
+                          if lt_data:
+                              instance_types = [lt_data[0].get("LaunchTemplateData",{}).get("InstanceType","")]
+                  ng_details.append({
+                      "name": ng,
+                      "status": d.get("status",""),
+                      "instance_types": instance_types,
+                      "desired": d.get("scalingConfig",{}).get("desiredSize",0),
+                      "min": d.get("scalingConfig",{}).get("minSize",0),
+                      "max": d.get("scalingConfig",{}).get("maxSize",0),
+                      "ami_type": d.get("amiType",""),
+                      "disk_size": d.get("diskSize",0),
+                  })
+              eks_clusters.append({
+                  "name": cname,
+                  "status": c.get("status",""),
+                  "version": c.get("version",""),
+                  "endpoint": c.get("endpoint",""),
+                  "nodegroups": ng_details,
+                  "logging": c.get("logging",{}).get("clusterLogging",[]),
+              })
+
+          # ── ALB + Target Groups 상세 ──
+          lbs = []
+          for lb in safe(lambda: elb.describe_load_balancers()["LoadBalancers"], []):
+              lb_arn = lb["LoadBalancerArn"]
+              tgs = safe(lambda: elb.describe_target_groups(LoadBalancerArn=lb_arn)["TargetGroups"], [])
+              listeners = safe(lambda: elb.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"], [])
+              tg_details = []
+              for tg in tgs:
+                  health = safe(lambda: elb.describe_target_health(
+                      TargetGroupArn=tg["TargetGroupArn"])["TargetHealthDescriptions"], [])
+                  tg_details.append({
+                      "name": tg["TargetGroupName"],
+                      "protocol": tg.get("Protocol",""),
+                      "port": tg.get("Port",""),
+                      "target_type": tg.get("TargetType",""),
+                      "healthy_count": sum(1 for h in health if h.get("TargetHealth",{}).get("State")=="healthy"),
+                      "total_count": len(health),
+                  })
+              lbs.append({
+                  "name": lb["LoadBalancerName"],
+                  "dns": lb.get("DNSName",""),
+                  "scheme": lb.get("Scheme",""),
+                  "type": lb.get("Type",""),
+                  "state": lb.get("State",{}).get("Code",""),
+                  "listeners": [{"port": l.get("Port",""), "protocol": l.get("Protocol","")} for l in listeners],
+                  "target_groups": tg_details,
+              })
+
+          # ── RDS ──
+          dbs = []
+          for db in safe(lambda: rds.describe_db_instances()["DBInstances"], []):
+              dbs.append({
+                  "id": db["DBInstanceIdentifier"],
+                  "engine": db.get("Engine",""),
+                  "engine_version": db.get("EngineVersion",""),
+                  "class": db.get("DBInstanceClass",""),
+                  "status": db.get("DBInstanceStatus",""),
+                  "multi_az": db.get("MultiAZ", False),
+                  "storage": db.get("AllocatedStorage", 0),
+                  "storage_type": db.get("StorageType",""),
+                  "endpoint": db.get("Endpoint",{}).get("Address",""),
+                  "backup_retention": db.get("BackupRetentionPeriod", 0),
+                  "publicly_accessible": db.get("PubliclyAccessible", False),
+              })
+
+          # ── S3 ──
+          buckets = []
+          for b in safe(lambda: s3.list_buckets()["Buckets"], []):
+              bname = b["Name"]
+              versioning    = safe(lambda: s3.get_bucket_versioning(Bucket=bname).get("Status","Disabled"), "Disabled")
+              public_access = safe(lambda: s3.get_public_access_block(Bucket=bname)["PublicAccessBlockConfiguration"], {})
+              buckets.append({
+                  "name": bname,
+                  "versioning": versioning or "Disabled",
+                  "block_public": public_access.get("BlockPublicAcls", False),
+              })
+
+          # ── DynamoDB ──
+          dynamo_tables = []
+          for t in safe(lambda: ddb.list_tables()["TableNames"], []):
+              d = safe(lambda: ddb.describe_table(TableName=t)["Table"], {})
+              dynamo_tables.append({
+                  "name": t,
+                  "status": d.get("TableStatus",""),
+                  "item_count": d.get("ItemCount", 0),
+                  "size_bytes": d.get("TableSizeBytes", 0),
+                  "billing_mode": d.get("BillingModeSummary",{}).get("BillingMode","PROVISIONED"),
+              })
+
+          # ── ECR ──
+          ecr_repos = []
+          for r in safe(lambda: ecr.describe_repositories()["repositories"], []):
+              ecr_repos.append({
+                  "name": r["repositoryName"],
+                  "uri": r["repositoryUri"],
+                  "scan_on_push": r.get("imageScanningConfiguration",{}).get("scanOnPush", False),
+                  "encryption": r.get("encryptionConfiguration",{}).get("encryptionType","AES256"),
+              })
+
+          # ── WAF ──
+          wafs = []
+          for w in safe(lambda: waf.list_web_acls(Scope="REGIONAL")["WebACLs"], []):
+              detail = safe(lambda: waf.get_web_acl(Name=w["Name"], Scope="REGIONAL", Id=w["Id"])["WebACL"], {})
+              wafs.append({
+                  "name": w["Name"],
+                  "id": w["Id"],
+                  "rule_count": len(detail.get("Rules",[])),
+                  "default_action": list(detail.get("DefaultAction",{}).keys())[0] if detail.get("DefaultAction") else "",
+              })
+
+          # ── Secrets Manager ──
+          secrets = []
+          for s in safe(lambda: sm.list_secrets()["SecretList"], []):
+              if s.get("DeletedDate"):
+                  continue
+              secrets.append({
+                  "name": s["Name"],
+                  "last_rotated": str(s.get("LastRotatedDate","")) or "미설정",
+                  "rotation_enabled": s.get("RotationEnabled", False),
+              })
+
+          result = {
+              "수집일시": now,
+              "region": region,
+              "VPC": vpcs,
+              "EKS": eks_clusters,
+              "ALB": lbs,
+              "RDS": dbs,
+              "S3": buckets,
+              "DynamoDB": dynamo_tables,
+              "ECR": ecr_repos,
+              "WAF": wafs,
+              "SecretsManager": secrets,
+          }
+
+          with open("infra-map.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+
+          print(f"=== 인프라 수집 완료 ===")
+          print(f"VPC: {len(vpcs)}개")
+          print(f"  NAT GW: {sum(len(v['nat_gateways']) for v in vpcs)}개")
+          print(f"  VPC Endpoints: {sum(len(v['vpc_endpoints']) for v in vpcs)}개")
+          print(f"  Route Tables: {sum(len(v['route_tables']) for v in vpcs)}개")
+          print(f"  NACLs: {sum(len(v['nacls']) for v in vpcs)}개")
+          print(f"EKS: {len(eks_clusters)}개")
+          print(f"ALB: {len(lbs)}개")
+          print(f"RDS: {len(dbs)}개")
+          print(f"S3: {len(buckets)}개")
+          print(f"DynamoDB: {len(dynamo_tables)}개")
+          print(f"ECR: {len(ecr_repos)}개")
+          print(f"WAF: {len(wafs)}개")
+          print(f"Secrets Manager: {len(secrets)}개")
+          PYEOF
+      - name: Upload infra map
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-map
+          path: infra-map.json
+          if-no-files-found: ignore

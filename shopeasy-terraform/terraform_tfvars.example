@@ -1,0 +1,19 @@
+project_name  = "shopeasy"
+environment   = "dev"
+region        = "ap-northeast-2"
+cluster_name  = "ShopEasy-EKS"
+cluster_version = "1.31"
+
+cluster_endpoint_public_access       = false
+cluster_endpoint_public_access_cidrs = []
+
+node_instance_type = "t3.medium"
+node_desired_size  = 2
+node_min_size      = 2
+node_max_size      = 3
+
+db_name            = "shopeasy"
+db_username        = "admin"
+db_engine_version  = "8.0"
+db_instance_class  = "db.t3.micro"
+db_allocated_storage = 20

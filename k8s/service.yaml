@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shopeasy-api
+  namespace: shopeasy
+  labels:
+    app: shopeasy-api
+spec:
+  type: ClusterIP
+  selector:
+    app: shopeasy-api
+  ports:
+    - port: 80
+      targetPort: 5000
+      protocol: TCP

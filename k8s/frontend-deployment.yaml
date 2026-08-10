@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shopeasy-frontend
+  namespace: shopeasy
+  labels:
+    app: shopeasy-frontend
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: shopeasy-frontend
+
+  template:
+    metadata:
+      labels:
+        app: shopeasy-frontend
+
+    spec:
+      containers:
+        - name: frontend
+          image: FRONTEND_IMAGE_PLACEHOLDER
+
+          ports:
+            - containerPort: 80
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+      nodeSelector:
+        workload: api

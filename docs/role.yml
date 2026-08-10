@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  DevSecOpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DevSecOpsTerraformRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: repo:사용자명/레포명:*  ← 실제 값을 입력해야합니다
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+Outputs:
+  RoleArn:
+    Value: !Sub "arn:aws:iam::${AWS::AccountId}:role/DevSecOpsTerraformRole"

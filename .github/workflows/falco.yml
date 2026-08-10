@@ -1,0 +1,138 @@
+name: Falco Alert Collect
+
+on:
+  workflow_run:
+    workflows: ["Deploy ShopEasy"]
+    types: [completed]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  collect:
+    name: Collect Falco Alerts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+
+      - name: Collect Falco alerts from S3
+        run: |
+          python3 << 'EOF'
+          import boto3, json, os
+          from datetime import datetime, timezone, timedelta
+
+          kst      = timezone(timedelta(hours=9))
+          region   = "ap-northeast-2"
+          s3       = boto3.client("s3", region_name=region)
+
+          # falco 버킷 자동 탐색
+          bucket = ""
+          for b in s3.list_buckets().get("Buckets", []):
+              if "falco" in b["Name"].lower():
+                  bucket = b["Name"]
+                  break
+
+          if not bucket:
+              print("Falco S3 버킷 없음 → 빈 결과 저장")
+              result = {
+                  "스캔일시": datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S"),
+                  "총_발견수": 0,
+                  "심각도별": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0},
+                  "취약점_목록": [],
+              }
+          else:
+              # 최근 24시간 alert 수집
+              cutoff  = datetime.now(timezone.utc) - timedelta(hours=24)
+              alerts  = []
+
+              paginator = s3.get_paginator("list_objects_v2")
+              for page in paginator.paginate(Bucket=bucket, Prefix="alerts/"):
+                  for obj in page.get("Contents", []):
+                      if obj["LastModified"] < cutoff:
+                          continue
+                      try:
+                          body = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+                          for line in body.decode("utf-8").splitlines():
+                              line = line.strip()
+                              if not line:
+                                  continue
+                              raw = json.loads(line)
+                              alerts.append(raw)
+                      except Exception as e:
+                          print(f"파일 읽기 실패: {obj['Key']} - {e}")
+                          continue
+
+              # priority → 심각도 매핑
+              priority_map = {
+                  "EMERGENCY": "CRITICAL", "ALERT": "CRITICAL", "CRITICAL": "CRITICAL",
+                  "ERROR": "HIGH", "WARNING": "MEDIUM",
+                  "NOTICE": "LOW", "INFO": "INFO", "DEBUG": "INFO",
+              }
+
+              sev_map  = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+              vuln_list = []
+
+              for raw in alerts:
+                  priority = str(raw.get("priority", raw.get("Priority", "INFO"))).upper()
+                  sev      = priority_map.get(priority, "INFO")
+                  sev_map[sev] = sev_map.get(sev, 0) + 1
+
+                  # 시간 KST 변환
+                  time_str = raw.get("time", raw.get("Time", ""))
+                  try:
+                      dt       = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                      time_kst = dt.astimezone(kst).strftime("%Y-%m-%d %H:%M:%S")
+                  except Exception:
+                      time_kst = time_str
+
+                  fields    = raw.get("output_fields", raw.get("OutputFields", {})) or {}
+                  container = fields.get("container.name", fields.get("k8s.pod.name", "-"))
+                  namespace = fields.get("k8s.ns.name", "-")
+                  image     = fields.get("container.image.repository", "-")
+
+                  vuln_list.append({
+                      "심각도":      sev,
+                      "시간":        time_kst,
+                      "규칙":        raw.get("rule",   raw.get("Rule",   "-")),
+                      "설명":        raw.get("output", raw.get("Output", "-")),
+                      "컨테이너":    container,
+                      "네임스페이스": namespace,
+                      "이미지":      image,
+                  })
+
+              # 최신순 정렬
+              vuln_list.sort(key=lambda x: x.get("시간", ""), reverse=True)
+
+              result = {
+                  "스캔일시": datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S"),
+                  "총_발견수": len(vuln_list),
+                  "심각도별": sev_map,
+                  "취약점_목록": vuln_list,
+              }
+
+              print(f"=== Falco 수집 완료 ===")
+              print(f"총 alert: {len(vuln_list)}건")
+              for s, c in sev_map.items():
+                  if c > 0:
+                      print(f"  {s}: {c}건")
+
+          os.makedirs("falco-summary", exist_ok=True)
+          with open("falco-summary/결과.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+          EOF
+
+      - name: Upload Falco results
+        uses: actions/upload-artifact@v4
+        with:
+          name: falco-results
+          path: falco-summary/
+          retention-days: 1
