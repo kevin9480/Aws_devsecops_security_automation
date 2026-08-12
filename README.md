@@ -115,6 +115,14 @@ Public 노출 최소화, Private 중심 통신, 트래픽·워크로드·계정�
 | **Security Insight** | 6개 보안 도구 결과를 GitHub Actions Artifact에서 수집, JSON 파싱 후 WARNING/RISK/SAFE 등급으로 자동 분류, 배포 완료 후 CloudFront URL 자동 추출 |
 | **AI Response Guide** | 취약점 클릭 시 LLM이 파일/라인/RuleID 기반 상세 조치 가이드를 실시간 생성 |
 
+**Keyless Deployment 화면**
+
+<img src="docs/dashboard-keyless-deployment.png" width="500">
+
+**Pipeline Visibility 화면**
+
+<img src="docs/dashboard-pipeline-visibility.png" width="500">
+
 **Security Insight 화면**
 
 <img src="docs/dashboard-security-insight.png" width="500">
@@ -196,8 +204,6 @@ aws-security-service-project/
 
 - **인프라 구축**: Terraform 기반 AWS 인프라 구축
 - **CI/CD 및 배포 자동화**: GitHub Actions 기반 배포 자동화 파이프라인 구현
-- **테스트**: 단위/통합 테스트
-- **프로젝트 관리**: 프로젝트 관리 체계 수립, 보고서 작성 및 발표
 
 ---
 
